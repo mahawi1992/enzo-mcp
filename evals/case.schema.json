@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mahawi1992/enzo-mcp/evals/case.schema.json",
+  "title": "Enzo offline evaluation case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "category",
+    "input",
+    "expected",
+    "tags",
+    "adjudication"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "category": {
+      "enum": [
+        "atomicity",
+        "evidence_status",
+        "source_independence",
+        "outbound_projection",
+        "sensor_abstention"
+      ]
+    },
+    "input": { "type": "object" },
+    "expected": { "type": "object" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "adjudication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviewer_count", "blind"],
+      "properties": {
+        "status": { "enum": ["PUBLIC_EXAMPLE", "HUMAN_ADJUDICATED"] },
+        "reviewer_count": { "type": "integer", "minimum": 0 },
+        "blind": { "type": "boolean" }
+      }
+    }
+  }
+}
+

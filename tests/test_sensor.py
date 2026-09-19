@@ -9,6 +9,7 @@ from typesafe_sdk import (
     Noul,
     NoulAnswer,
     Questions,
+    RetryPolicy,
     ScoreAnswer,
     SystemOneResponse,
     Usage,
@@ -16,6 +17,7 @@ from typesafe_sdk import (
 
 from enzo_mcp.engine import EnzoEngine
 from enzo_mcp.models import (
+    AtomicRequest,
     ContextItem,
     ContextKind,
     DependencyGroup,
@@ -25,6 +27,8 @@ from enzo_mcp.models import (
     EvidenceRecord,
     EvidenceRequirement,
     ExpectedAnswerType,
+    JevDispatchSelection,
+    JEVResult,
     ObserveRequest,
     PredicateOperator,
     Provenance,
@@ -48,7 +52,9 @@ class FakeSystemOneClient:
         questions: Questions,
         *,
         model: str | None = None,
+        retry: RetryPolicy | None = None,
     ) -> SystemOneResponse:
+        del retry
         self.calls += 1
         self.state = state
         self.questions = questions
@@ -58,6 +64,48 @@ class FakeSystemOneClient:
             usage=Usage(input_tokens=12, output_tokens=1),
             answers={"claim": self.answer},
         )
+
+
+def _selection_for(
+    atom: AtomicRequest,
+    evidence: tuple[EvidenceRecord, ...] = (),
+) -> JevDispatchSelection:
+    context_keys = tuple(item.key for item in atom.context)
+    evidence_ids = () if context_keys else tuple(item.id for item in evidence)
+    return JevDispatchSelection(context_keys=context_keys, evidence_ids=evidence_ids)
+
+
+async def _observe_with_approval(
+    engine: EnzoEngine,
+    atom: AtomicRequest,
+    *,
+    evidence: tuple[EvidenceRecord, ...] = (),
+    satisfied_constraints: tuple[str, ...] = (),
+    missing_information: tuple[str, ...] = (),
+) -> tuple[JEVResult, ObserveRequest]:
+    selection = _selection_for(atom, evidence)
+    preview = await engine.observe(
+        ObserveRequest(
+            investigation_id=atom.investigation_id,
+            atom_id=atom.id,
+            evidence=evidence,
+            dispatch_selection=selection,
+            satisfied_constraints=satisfied_constraints,
+            missing_information=missing_information,
+        )
+    )
+    assert preview.dispatch_manifest is not None
+    approved = ObserveRequest(
+        allow_external_jev=True,
+        investigation_id=atom.investigation_id,
+        atom_id=atom.id,
+        evidence=evidence,
+        dispatch_selection=selection,
+        approved_dispatch_sha256=preview.dispatch_manifest.canonical_sha256,
+        satisfied_constraints=satisfied_constraints,
+        missing_information=missing_information,
+    )
+    return await engine.observe(approved), approved
 
 
 async def test_pydantic_jev_verifies_supported_boolean_atom(make_request) -> None:
@@ -82,13 +130,7 @@ async def test_pydantic_jev_verifies_supported_boolean_atom(make_request) -> Non
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.VERIFIED
     assert result.evidence[0].kind is EvidenceKind.SENSOR_OUTPUT
@@ -102,16 +144,15 @@ async def test_pydantic_jev_verifies_supported_boolean_atom(make_request) -> Non
     assert claim["predicate"] == "sets Secure=true"
     assert claim["scope"] == "production session configuration"
     assert claim["operator"] == "EQUALS"
-    assert claim["expected_value"] is True
     assert claim["expected_answer_type"] == "BOOLEAN"
-    requirements = cast(list[dict[str, object]], claim["evidence_requirements"])
-    assert requirements[0]["id"] == "jev-observation"
+    assert "expected_value" not in claim
+    assert "evidence_requirements" not in claim
     assert state["scope"] == "production session configuration"
     context = cast(list[dict[str, object]], state["context"])
     assert context[0]["kind"] == "ASSUMPTION"
 
 
-async def test_pydantic_jev_sends_complete_atomic_claim_contract(make_request) -> None:
+async def test_pydantic_jev_sends_minimal_atomic_claim_contract(make_request) -> None:
     requirement = EvidenceRequirement(
         id="semantic-choice",
         description="Jev selects the deployment state from supplied evidence",
@@ -147,13 +188,7 @@ async def test_pydantic_jev_sends_complete_atomic_claim_contract(make_request) -
         )
     )
 
-    await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    await _observe_with_approval(engine, atomized.atom)
 
     state = cast(dict[str, object], client.state)
     claim = cast(dict[str, object], state["claim"])
@@ -163,23 +198,10 @@ async def test_pydantic_jev_sends_complete_atomic_claim_contract(make_request) -
         "predicate": "has the selected state",
         "scope": "the supplied deployment record",
         "operator": "EQUALS",
-        "expected_value": "enabled",
         "quantifier": "ONE",
         "expected_answer_type": "CHOICE",
         "answer_options": ["enabled", "disabled"],
         "score_criteria": [],
-        "operational_definition": "Select the state explicitly named in the record.",
-        "verification_method": "SEMANTIC_SENSOR",
-        "evidence_requirements": [
-            {
-                "id": "semantic-choice",
-                "description": "Jev selects the deployment state from supplied evidence",
-                "accepted_kinds": ["SENSOR_OUTPUT"],
-                "minimum_items": 1,
-                "required": True,
-                "deterministic_required": False,
-            }
-        ],
     }
 
 
@@ -204,13 +226,7 @@ async def test_pydantic_jev_keeps_uncertain_boolean_unresolved(make_request) -> 
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.INSUFFICIENT_EVIDENCE
     assert "did not cross a decision threshold" in result.missing_information[0]
@@ -238,13 +254,7 @@ async def test_pydantic_jev_honors_false_boolean_expectation(make_request) -> No
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.CONTRADICTED
 
@@ -279,13 +289,7 @@ async def test_pydantic_jev_maps_high_confidence_choice_mismatch(make_request) -
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.CONTRADICTED
 
@@ -322,13 +326,7 @@ async def test_pydantic_jev_maps_high_confidence_score_match(make_request) -> No
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.VERIFIED
 
@@ -363,13 +361,7 @@ async def test_pydantic_jev_rejects_choice_outside_requested_options(make_reques
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "outside the requested answer options" in result.missing_information[0]
@@ -407,13 +399,7 @@ async def test_pydantic_jev_rejects_score_outside_requested_rubric(make_request)
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "outside the requested rubric" in result.missing_information[0]
@@ -440,13 +426,7 @@ async def test_pydantic_jev_rejects_out_of_range_noul_probability(make_request) 
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "finite [0, 1] range" in result.missing_information[0]
@@ -482,13 +462,7 @@ async def test_pydantic_jev_rejects_non_normalized_choice_distribution(make_requ
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "invalid choice probability distribution" in result.missing_information[0]
@@ -526,13 +500,7 @@ async def test_pydantic_jev_rejects_out_of_range_score_confidence(make_request) 
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "score confidence outside" in result.missing_information[0]
@@ -564,6 +532,7 @@ async def test_external_jev_send_requires_per_observation_consent(make_request) 
         ObserveRequest(
             investigation_id=atomized.investigation_id,
             atom_id=atomized.atom.id,
+            dispatch_selection=_selection_for(atomized.atom),
         )
     )
 
@@ -595,17 +564,22 @@ async def test_unconsented_observation_can_be_retried_with_consent(make_request)
         )
     )
 
+    selection = _selection_for(atomized.atom)
     first = await engine.observe(
         ObserveRequest(
             investigation_id=atomized.investigation_id,
             atom_id=atomized.atom.id,
+            dispatch_selection=selection,
         )
     )
+    assert first.dispatch_manifest is not None
     second = await engine.observe(
         ObserveRequest(
             allow_external_jev=True,
             investigation_id=atomized.investigation_id,
             atom_id=atomized.atom.id,
+            dispatch_selection=selection,
+            approved_dispatch_sha256=first.dispatch_manifest.canonical_sha256,
         )
     )
 
@@ -646,13 +620,7 @@ async def test_pydantic_jev_rejects_score_inconsistent_with_distribution(make_re
         )
     )
 
-    result = await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    result, _ = await _observe_with_approval(engine, atomized.atom)
 
     assert result.status is SemanticStatus.UNKNOWN
     assert "probability-weighted rubric value" in result.missing_information[0]
@@ -679,13 +647,7 @@ async def test_repeated_semantic_observation_is_idempotent(make_request) -> None
             verification_method=VerificationMethod.SEMANTIC_SENSOR,
         )
     )
-    observation = ObserveRequest(
-        allow_external_jev=True,
-        investigation_id=atomized.investigation_id,
-        atom_id=atomized.atom.id,
-    )
-
-    first = await engine.observe(observation)
+    first, observation = await _observe_with_approval(engine, atomized.atom)
     second = await engine.observe(observation)
 
     assert second == first
@@ -716,15 +678,12 @@ async def test_repeated_evidence_bearing_observation_is_idempotent(make_request)
         verification_method=VerificationMethod.HUMAN_OBSERVATION,
         provenance=Provenance(provider="caller", locator="request:caller-observation"),
     )
-    observation = ObserveRequest(
-        allow_external_jev=True,
-        investigation_id=atomized.investigation_id,
-        atom_id=atomized.atom.id,
+    first, observation = await _observe_with_approval(
+        engine,
+        atomized.atom,
         evidence=(caller_evidence,),
         satisfied_constraints=("Caller evidence was collected",),
     )
-
-    first = await engine.observe(observation)
     retry_payload = observation.model_dump(mode="json")
     retry_evidence = cast(list[dict[str, object]], retry_payload["evidence"])
     retry_provenance = cast(dict[str, object], retry_evidence[0]["provenance"])
@@ -736,7 +695,7 @@ async def test_repeated_evidence_bearing_observation_is_idempotent(make_request)
     assert sum(item.kind is EvidenceKind.SENSOR_OUTPUT for item in second.evidence) == 1
 
 
-async def test_dependency_change_accepts_transport_retry_evidence(
+async def test_dependency_change_reuses_approved_sensor_assessment(
     make_request,
     make_evidence,
 ) -> None:
@@ -789,13 +748,11 @@ async def test_dependency_change_accepts_transport_retry_evidence(
         verification_method=VerificationMethod.HUMAN_OBSERVATION,
         provenance=Provenance(provider="caller", locator="request:dependency-retry"),
     )
-    observation = ObserveRequest(
-        allow_external_jev=True,
-        investigation_id=dependent.investigation_id,
-        atom_id=dependent.id,
+    first, observation = await _observe_with_approval(
+        engine,
+        dependent,
         evidence=(caller_evidence,),
     )
-    first = await engine.observe(observation)
 
     await engine.observe(
         ObserveRequest(
@@ -820,7 +777,7 @@ async def test_dependency_change_accepts_transport_retry_evidence(
 
     assert first.status is SemanticStatus.VERIFIED
     assert second.status is SemanticStatus.INSUFFICIENT_EVIDENCE
-    assert client.calls == 2
+    assert client.calls == 1
 
 
 async def test_prior_sensor_output_is_not_sent_back_to_jev(make_request) -> None:
@@ -844,24 +801,17 @@ async def test_prior_sensor_output_is_not_sent_back_to_jev(make_request) -> None
             verification_method=VerificationMethod.SEMANTIC_SENSOR,
         )
     )
-    await engine.observe(
-        ObserveRequest(
-            allow_external_jev=True,
-            investigation_id=atomized.investigation_id,
-            atom_id=atomized.atom.id,
-        )
-    )
+    _, approved = await _observe_with_approval(engine, atomized.atom)
 
-    reevaluation = ObserveRequest(
-        allow_external_jev=True,
-        investigation_id=atomized.investigation_id,
-        atom_id=atomized.atom.id,
-        missing_information=("A new caller-supplied gap requires reevaluation",),
+    reevaluation = approved.model_copy(
+        update={
+            "missing_information": ("A new caller-supplied gap requires reevaluation",),
+        }
     )
     second = await engine.observe(reevaluation)
     replay = await engine.observe(reevaluation)
 
-    assert client.calls == 2
+    assert client.calls == 1
     assert replay == second
     state = cast(dict[str, object], client.state)
     assert state["evidence"] == []

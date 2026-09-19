@@ -14,7 +14,7 @@
   <a href="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="MCP tools" src="https://img.shields.io/badge/MCP-3_tools-111827">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-55_passing-2EA043">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-72_passing-2EA043">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-D22128"></a>
 </p>
 
@@ -50,7 +50,7 @@ apply pressure before that answer exists:
 | Missing information becomes vague confidence | Return `UNKNOWN` with the exact gap |
 | Semantic judgment overrides a test | Deterministic evidence remains authoritative |
 | Conclusions lose their history | Preserve evidence, provenance, revisions, and dependencies |
-| A tool quietly sends context outside the process | Require consent for every external Jev observation |
+| A tool quietly sends context outside the process | Preview an allowlisted payload and bind the send to its SHA-256 digest |
 
 ## How it works
 
@@ -94,8 +94,15 @@ file containing:
 TYPESAFE_API_KEY=your-key
 ```
 
-The file is ignored by Git. Every external observation still requires
-`allow_external_jev=true`; configuring a key alone never authorizes a send.
+The file is ignored by Git. Configuring a key alone never authorizes a send.
+Every external observation requires an explicit field selection, a previewed
+manifest, `allow_external_jev=true`, and the matching manifest SHA-256.
+
+Run with the local key loaded when semantic sensing is needed:
+
+```bash
+uv run --env-file .env enzo-mcp
+```
 
 ### Add Enzo to Codex
 
@@ -183,16 +190,43 @@ Jev's native probability or confidence is preserved in sensor evidence. Enzo doe
 not manufacture an aggregate confidence score. A deterministic instrument is used
 first whenever it can resolve the atom more reliably.
 
-For an explicitly authorized observation, Jev receives a structured `claim` object
-containing the question, subject, predicate, scope, operator, expected answer,
-answer contract, operational definition, verification method, and evidence
-requirements. This keeps Jev's semantic judgment grounded in the same atomic
-contract that Enzo validated instead of asking it to infer the claim from a short
-question alone.
+Jev receives only a caller-selected projection. The logical request contains the
+model, a minimal typed question contract, selected context keys, and selected
+evidence records. Expected answers, investigation IDs, evidence requirement IDs,
+unselected values, and prior sensor output remain local. Evidence payloads,
+assumptions, and provenance are excluded unless each category is explicitly
+enabled in the selection.
+
+External dispatch is deliberately two-phase:
+
+1. Call `enzo_observe` with `dispatch_selection`. Enzo returns a canonical manifest
+   and makes zero provider calls.
+2. Review that exact logical request in the host.
+3. Repeat the observation with the same selection, `allow_external_jev=true`, and
+   `approved_dispatch_sha256` set to the manifest digest.
+
+Enzo rebuilds the logical provider inputs `{model, state, questions}` and sends only
+when the digest still matches. Changing any selected content invalidates the prior
+approval. A matching digest records what the caller approved; it is not proof that
+a human saw or understood the request.
+
+Selections are capped at eight context entries and eight evidence entries, with a
+4 KiB limit per selected value and a 16 KiB canonical logical-request limit. Limit
+failures and hash mismatches make zero Jev calls.
 
 Prior sensor output is never sent back into a later Jev request, preventing semantic
 feedback loops. Exact observation retries are idempotent, while dependency changes
-correctly invalidate replayed results.
+correctly invalidate replayed results. A manifest-bound provider failure is also
+cached to prevent an ambiguous transport retry from making a duplicate external
+call; an intentional retry must use a new `approval_reference`.
+
+## AG-UI boundary
+
+AG-UI is a good future host adapter for displaying a manifest, pausing on a typed
+approval interrupt, and resuming with the reviewed digest. It is not a durable
+database or a crash-replay guarantee. Enzo therefore keeps the approval invariant
+in its core and leaves restart persistence to the integrating runtime. See
+[the integration boundary](docs/ag-ui-boundary.md).
 
 ## Design principles
 
@@ -216,21 +250,22 @@ uv run pytest
 uv build
 ```
 
-The current suite contains 55 tests covering contracts, atomicity, dependency
-derivation, revision history, consent, Jev answer validation, replay safety, and the
-stdio MCP surface.
+The current suite contains 72 tests covering contracts, atomicity, dependency
+derivation, revision history, manifest-bound dispatch, payload canaries and limits,
+generated replay and dependency invariants, offline evaluation fixtures, Jev answer
+validation, and the stdio MCP surface.
 
 ## Privacy
 
-Semantic observations are local-only by default. Setting
-`allow_external_jev=true` authorizes that single request to send its supplied
-claim contract, context, and non-sensor evidence to TypeSafe/Jev. Redact
-credentials, personal data, and unrelated sensitive information from all three
-before enabling an external observation.
+Semantic observations are local-only by default. `allow_external_jev=true` alone
+does nothing. An external call also needs an explicit `dispatch_selection` and a
+matching `approved_dispatch_sha256`. Preview the manifest, select only necessary
+fields, and keep payload, assumption, and provenance flags off unless Jev needs
+them. Redact credentials and personal data before any external observation.
 
 ## Project status
 
-Enzo is a focused v0.1 implementation. Its three-tool surface is intentional; the
+Enzo is a focused v0.2 alpha implementation. Its three-tool surface is intentional; the
 contracts may evolve as real investigations expose better invariants.
 
 Focused issues and pull requests are welcome. If the idea of turning large circles

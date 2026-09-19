@@ -6,12 +6,15 @@ from pydantic import ValidationError
 from enzo_mcp.engine import EnzoEngine
 from enzo_mcp.models import (
     AtomicityDecision,
+    ContextItem,
+    ContextKind,
     DependencyGroup,
     DependencyRole,
     EvidenceDirection,
     EvidenceKind,
     EvidenceRecord,
     EvidenceRequirement,
+    JevDispatchSelection,
     ObserveRequest,
     PredicateOperator,
     ProposedAtom,
@@ -187,13 +190,36 @@ async def test_out_of_contract_support_cannot_satisfy_optional_requirement(
 async def test_no_jev_and_no_evidence_is_unknown(make_request, monkeypatch) -> None:
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     engine = EnzoEngine()
-    atom = (await engine.atomize(make_request())).atom
+    atom = (
+        await engine.atomize(
+            make_request(
+                context=(
+                    ContextItem(
+                        key="selected-context",
+                        value="safe preview value",
+                        kind=ContextKind.ASSUMPTION,
+                    ),
+                )
+            )
+        )
+    ).atom
+    selection = JevDispatchSelection(context_keys=("selected-context",))
+    preview = await engine.observe(
+        ObserveRequest(
+            investigation_id=atom.investigation_id,
+            atom_id=atom.id,
+            dispatch_selection=selection,
+        )
+    )
+    assert preview.dispatch_manifest is not None
 
     result = await engine.observe(
         ObserveRequest(
             allow_external_jev=True,
             investigation_id=atom.investigation_id,
             atom_id=atom.id,
+            dispatch_selection=selection,
+            approved_dispatch_sha256=preview.dispatch_manifest.canonical_sha256,
         )
     )
 

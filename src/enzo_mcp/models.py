@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 from uuid import uuid4
 
 from pydantic import (
@@ -376,11 +376,142 @@ class EvidenceRecord(ContractModel):
         return self
 
 
+class JevDispatchSelection(ContractModel):
+    """The caller-selected, least-privilege state eligible for one Jev request."""
+
+    context_keys: tuple[str, ...] = Field(default=(), max_length=8)
+    evidence_ids: tuple[str, ...] = Field(default=(), max_length=8)
+    include_context_provenance: StrictBool = False
+    include_evidence_payloads: StrictBool = False
+    include_assumptions: StrictBool = False
+    include_evidence_provenance: StrictBool = False
+
+    @model_validator(mode="after")
+    def selectors_are_explicit_and_unique(self) -> Self:
+        if len(self.context_keys) != len(set(self.context_keys)):
+            raise ValueError("context_keys must be unique")
+        if len(self.evidence_ids) != len(set(self.evidence_ids)):
+            raise ValueError("evidence_ids must be unique")
+        if not self.context_keys and not self.evidence_ids:
+            raise ValueError("a Jev dispatch selection must select context or evidence")
+        return self
+
+
+class JevQuestion(ContractModel):
+    """The typed question primitive that is safe to disclose to the semantic sensor."""
+
+    question: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    predicate: str = Field(min_length=1)
+    scope: str = Field(min_length=1)
+    operator: PredicateOperator
+    quantifier: Quantifier
+    expected_answer_type: ExpectedAnswerType
+    answer_options: tuple[str, ...] = ()
+    score_criteria: tuple[str, ...] = ()
+
+
+class JevContextState(ContractModel):
+    key: str = Field(min_length=1)
+    value: JsonValue
+    kind: ContextKind
+    provenance: Provenance | None = None
+
+
+class JevEvidenceState(ContractModel):
+    direction: EvidenceDirection
+    kind: EvidenceKind
+    summary: str = Field(min_length=1)
+    payload: JsonValue | None = None
+    deterministic: StrictBool
+    verification_method: VerificationMethod
+    provenance: Provenance | None = None
+    assumptions: tuple[str, ...] = ()
+
+
+class JevState(ContractModel):
+    """The exact JSON state argument supplied to TypeSafe/Jev."""
+
+    claim: JevQuestion
+    scope: str = Field(min_length=1)
+    context: tuple[JevContextState, ...] = ()
+    evidence: tuple[JevEvidenceState, ...] = ()
+
+
+class JevNoulQuestion(ContractModel):
+    type: Literal["noul"] = "noul"
+    instructions: str = Field(min_length=1)
+
+
+class JevChoiceQuestion(ContractModel):
+    type: Literal["choice"] = "choice"
+    instructions: str = Field(min_length=1)
+    criteria: dict[str, str] = Field(min_length=2)
+
+
+class JevScoreQuestion(ContractModel):
+    type: Literal["score"] = "score"
+    instructions: str = Field(min_length=1)
+    criteria: tuple[str, ...] = Field(min_length=2)
+
+
+JevProviderQuestion = JevNoulQuestion | JevChoiceQuestion | JevScoreQuestion
+
+
+class JevQuestions(ContractModel):
+    claim: JevProviderQuestion
+
+
+class JevLogicalRequest(ContractModel):
+    """The exact logical provider inputs: model, state, and question primitive."""
+
+    model: str = Field(min_length=1)
+    state: JevState
+    questions: JevQuestions
+
+    @model_validator(mode="after")
+    def question_matches_state(self) -> Self:
+        question = self.questions.claim
+        claim = self.state.claim
+        expected_type = {
+            ExpectedAnswerType.BOOLEAN: "noul",
+            ExpectedAnswerType.CHOICE: "choice",
+            ExpectedAnswerType.SCORE: "score",
+        }[claim.expected_answer_type]
+        if question.type != expected_type or question.instructions != claim.question:
+            raise ValueError("Jev question primitive must match the selected typed claim")
+        if question.type == "choice" and question.criteria != {
+            option: option for option in claim.answer_options
+        }:
+            raise ValueError("choice question criteria must match answer_options")
+        if question.type == "score" and question.criteria != claim.score_criteria:
+            raise ValueError("score question criteria must match score_criteria")
+        return self
+
+
+class JevDispatchManifest(ContractModel):
+    """Canonical preview and approval record for a logical outbound request.
+
+    A matching digest records the host/caller's approval assertion for this logical
+    request. It intentionally does not prove a human-consent event.
+    """
+
+    schema_version: StrictInt = Field(default=1, ge=1)
+    canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_length: StrictInt = Field(ge=1)
+    logical_request: JevLogicalRequest
+    selection: JevDispatchSelection
+    approval_reference: str | None = Field(default=None, min_length=1)
+
+
 class ObserveRequest(ContractModel):
     investigation_id: str = Field(min_length=1)
     atom_id: str = Field(min_length=1)
     evidence: tuple[EvidenceRecord, ...] = ()
     allow_external_jev: StrictBool = False
+    dispatch_selection: JevDispatchSelection | None = None
+    approved_dispatch_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    approval_reference: str | None = Field(default=None, min_length=1)
     satisfied_constraints: tuple[str, ...] = ()
     violated_constraints: tuple[str, ...] = ()
     missing_information: tuple[str, ...] = ()
@@ -411,6 +542,7 @@ class JEVResult(ContractModel):
     verification_method: VerificationMethod
     parent_impact: ParentImpact
     source: ResultSource
+    dispatch_manifest: JevDispatchManifest | None = None
 
     @model_validator(mode="after")
     def status_has_required_support(self) -> Self:

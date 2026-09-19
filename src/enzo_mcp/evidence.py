@@ -11,6 +11,7 @@ from .models import (
     EvidenceDirection,
     EvidenceRecord,
     EvidenceRequirement,
+    JevDispatchManifest,
     JEVResult,
     ParentImpact,
     ResultSource,
@@ -63,6 +64,7 @@ class EvidenceEvaluator:
         supplied_satisfied_constraints: tuple[str, ...] = (),
         supplied_violated_constraints: tuple[str, ...] = (),
         supplied_missing_information: tuple[str, ...] = (),
+        dispatch_manifest: JevDispatchManifest | None = None,
     ) -> JEVResult:
         self._validate_requirement_references(atom, evidence)
 
@@ -164,6 +166,7 @@ class EvidenceEvaluator:
             verification_method=verification_method,
             parent_impact=parent_impact,
             source=source,
+            dispatch_manifest=dispatch_manifest,
         )
 
     @staticmethod

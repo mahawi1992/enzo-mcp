@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 
@@ -23,7 +24,19 @@ from .models import (
     EvidenceRecord,
     InvestigationState,
     InvestigationView,
+    JevChoiceQuestion,
+    JevContextState,
+    JevDispatchManifest,
+    JevDispatchSelection,
+    JevEvidenceState,
+    JevLogicalRequest,
+    JevNoulQuestion,
+    JevProviderQuestion,
+    JevQuestion,
+    JevQuestions,
     JEVResult,
+    JevScoreQuestion,
+    JevState,
     ObserveRequest,
     ParentImpact,
     ProposedAtom,
@@ -49,6 +62,11 @@ _CLAIM_FIELDS = (
     "evidence_requirements",
     "verification_method",
 )
+_MAX_JEV_CONTEXT_ENTRIES = 8
+_MAX_JEV_EVIDENCE_ENTRIES = 8
+_MAX_JEV_SELECTED_VALUE_BYTES = 4 * 1024
+_MAX_JEV_CANONICAL_REQUEST_BYTES = 16 * 1024
+_JEV_MANIFEST_SCHEMA_VERSION = 1
 
 
 def _claim_values(spec: ClaimSpec) -> dict[str, object]:
@@ -73,6 +91,9 @@ class EnzoEngine:
         self._observation_replays: dict[
             tuple[str, str],
             tuple[str, tuple[tuple[str, SemanticStatus], ...]],
+        ] = {}
+        self._jev_dispatch_assessments: dict[
+            tuple[str, str, str, str | None], SensorAssessment
         ] = {}
         self._lock = asyncio.Lock()
 
@@ -217,26 +238,48 @@ class EnzoEngine:
                 evidence=evidence,
                 dependency_statuses=dependency_statuses,
             )
-            if should_use_sensor and request.allow_external_jev:
-                sensor_input = tuple(
-                    item for item in evidence if item.kind is not EvidenceKind.SENSOR_OUTPUT
-                )
-                sensor_assessment = await self._sensor.evaluate(record.atom, sensor_input)
+            dispatch_manifest: JevDispatchManifest | None = None
+            if should_use_sensor and request.dispatch_selection is not None:
+                try:
+                    dispatch_manifest = self._prepare_jev_manifest(
+                        atom=record.atom,
+                        evidence=evidence,
+                        selection=request.dispatch_selection,
+                        approval_reference=request.approval_reference,
+                    )
+                except ValueError as error:
+                    sensor_assessment = self._dispatch_blocked_assessment(str(error))
+                else:
+                    if not request.allow_external_jev:
+                        sensor_assessment = self._dispatch_blocked_assessment(
+                            "external Jev evaluation requires allow_external_jev=true"
+                        )
+                    elif request.approved_dispatch_sha256 != dispatch_manifest.canonical_sha256:
+                        sensor_assessment = self._dispatch_blocked_assessment(
+                            "external Jev evaluation requires a matching approved_dispatch_sha256"
+                        )
+                    else:
+                        dispatch_key = (
+                            request.investigation_id,
+                            request.atom_id,
+                            dispatch_manifest.canonical_sha256,
+                            request.approval_reference,
+                        )
+                        prior_assessment = self._jev_dispatch_assessments.get(dispatch_key)
+                        if prior_assessment is None:
+                            # Reserve the approval before I/O so an unexpected exception cannot
+                            # make the same in-process assertion spendable twice.
+                            sensor_assessment = self._dispatch_attempted_assessment()
+                            self._jev_dispatch_assessments[dispatch_key] = sensor_assessment
+                            sensor_assessment = await self._sensor.evaluate(
+                                record.atom, dispatch_manifest
+                            )
+                            self._jev_dispatch_assessments[dispatch_key] = sensor_assessment
+                        else:
+                            sensor_assessment = prior_assessment
             elif should_use_sensor:
-                sensor_assessment = SensorAssessment(
-                    status=SemanticStatus.UNKNOWN,
-                    missing_information=(
-                        "external Jev evaluation requires allow_external_jev=true",
-                    ),
-                    provenance=Provenance(
-                        provider="enzo",
-                        locator="sensor:jev:external-send-not-authorized",
-                        tool="EnzoEngine",
-                    ),
-                    explanation=(
-                        "No context or evidence was transmitted to TypeSafe/Jev because this "
-                        "observation did not explicitly allow the external request."
-                    ),
+                sensor_assessment = self._dispatch_blocked_assessment(
+                    "external Jev evaluation requires an explicit dispatch_selection"
                 )
             else:
                 sensor_assessment = SensorAssessment(
@@ -269,6 +312,7 @@ class EnzoEngine:
                 supplied_satisfied_constraints=request.satisfied_constraints,
                 supplied_violated_constraints=request.violated_constraints,
                 supplied_missing_information=request.missing_information,
+                dispatch_manifest=dispatch_manifest,
             )
 
             new_atoms = dict(state.atoms)
@@ -440,12 +484,197 @@ class EnzoEngine:
             merged[item.id] = item
         return tuple(merged.values())
 
+    def _prepare_jev_manifest(
+        self,
+        *,
+        atom: AtomicRequest,
+        evidence: tuple[EvidenceRecord, ...],
+        selection: JevDispatchSelection,
+        approval_reference: str | None,
+    ) -> JevDispatchManifest:
+        """Project selected state, enforce outbound limits, and canonicalize it.
+
+        The digest is an approval check for this logical request only. It does not
+        imply that a particular person reviewed or consented to the dispatch.
+        """
+
+        if len(selection.context_keys) > _MAX_JEV_CONTEXT_ENTRIES:
+            raise ValueError("Jev dispatch exceeds the maximum of 8 context entries")
+        if len(selection.evidence_ids) > _MAX_JEV_EVIDENCE_ENTRIES:
+            raise ValueError("Jev dispatch exceeds the maximum of 8 evidence entries")
+
+        context_by_key = {item.key: item for item in atom.context}
+        if len(context_by_key) != len(atom.context):
+            raise ValueError("Jev dispatch cannot select ambiguous duplicate context keys")
+        unknown_context = set(selection.context_keys) - set(context_by_key)
+        if unknown_context:
+            raise ValueError(
+                f"Jev dispatch selects unknown context keys: {sorted(unknown_context)!r}"
+            )
+
+        evidence_by_id = {item.id: item for item in evidence}
+        unknown_evidence = set(selection.evidence_ids) - set(evidence_by_id)
+        if unknown_evidence:
+            raise ValueError(
+                f"Jev dispatch selects unknown evidence ids: {sorted(unknown_evidence)!r}"
+            )
+
+        selected_context: list[JevContextState] = []
+        for key in selection.context_keys:
+            context_item = context_by_key[key]
+            self._require_jev_size(context_item.value, "selected context value")
+            selected_context.append(
+                JevContextState(
+                    key=context_item.key,
+                    value=context_item.value,
+                    kind=context_item.kind,
+                    provenance=(
+                        context_item.provenance if selection.include_context_provenance else None
+                    ),
+                )
+            )
+
+        selected_evidence: list[JevEvidenceState] = []
+        for evidence_id in selection.evidence_ids:
+            evidence_item = evidence_by_id[evidence_id]
+            if evidence_item.kind is EvidenceKind.SENSOR_OUTPUT:
+                raise ValueError("Jev dispatch cannot include prior SENSOR_OUTPUT evidence")
+            outbound_evidence = JevEvidenceState(
+                direction=evidence_item.direction,
+                kind=evidence_item.kind,
+                summary=evidence_item.summary,
+                payload=(evidence_item.payload if selection.include_evidence_payloads else None),
+                deterministic=evidence_item.deterministic,
+                verification_method=evidence_item.verification_method,
+                provenance=(
+                    evidence_item.provenance if selection.include_evidence_provenance else None
+                ),
+                assumptions=(evidence_item.assumptions if selection.include_assumptions else ()),
+            )
+            self._require_jev_size(
+                outbound_evidence.model_dump(mode="json"), "selected evidence record"
+            )
+            selected_evidence.append(outbound_evidence)
+
+        logical_request = JevLogicalRequest(
+            model=self._jev_model_name(),
+            state=JevState(
+                claim=JevQuestion(
+                    question=atom.question,
+                    subject=atom.subject,
+                    predicate=atom.predicate,
+                    scope=atom.scope,
+                    operator=atom.operator,
+                    quantifier=atom.quantifier,
+                    expected_answer_type=atom.expected_answer_type,
+                    answer_options=atom.answer_options,
+                    score_criteria=atom.score_criteria,
+                ),
+                scope=atom.scope,
+                context=tuple(selected_context),
+                evidence=tuple(selected_evidence),
+            ),
+            questions=JevQuestions(claim=self._jev_provider_question(atom)),
+        )
+        canonical_bytes = self._canonical_json_bytes(logical_request.model_dump(mode="json"))
+        if len(canonical_bytes) > _MAX_JEV_CANONICAL_REQUEST_BYTES:
+            raise ValueError("Jev dispatch exceeds the 16KiB canonical request limit")
+        return JevDispatchManifest(
+            schema_version=_JEV_MANIFEST_SCHEMA_VERSION,
+            canonical_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+            byte_length=len(canonical_bytes),
+            logical_request=logical_request,
+            selection=selection,
+            approval_reference=approval_reference,
+        )
+
+    @staticmethod
+    def _jev_provider_question(atom: AtomicRequest) -> JevProviderQuestion:
+        if atom.expected_answer_type.value == "BOOLEAN":
+            return JevNoulQuestion(instructions=atom.question)
+        if atom.expected_answer_type.value == "CHOICE":
+            return JevChoiceQuestion(
+                instructions=atom.question,
+                criteria={option: option for option in atom.answer_options},
+            )
+        return JevScoreQuestion(
+            instructions=atom.question,
+            criteria=atom.score_criteria,
+        )
+
+    def _jev_model_name(self) -> str:
+        model_name = getattr(self._sensor, "model_name", None)
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("Jev sensor does not expose a configured model name")
+        return model_name
+
+    @staticmethod
+    def _canonical_json_bytes(value: object) -> bytes:
+        try:
+            return json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Jev dispatch state cannot be represented as canonical JSON"
+            ) from error
+
+    @classmethod
+    def _require_jev_size(cls, value: object, description: str) -> None:
+        if len(cls._canonical_json_bytes(value)) > _MAX_JEV_SELECTED_VALUE_BYTES:
+            raise ValueError(f"Jev dispatch {description} exceeds the 4KiB limit")
+
+    @staticmethod
+    def _dispatch_blocked_assessment(message: str) -> SensorAssessment:
+        return SensorAssessment(
+            status=SemanticStatus.UNKNOWN,
+            missing_information=(message,),
+            provenance=Provenance(
+                provider="enzo",
+                locator="sensor:jev:external-send-not-authorized",
+                tool="EnzoEngine",
+            ),
+            explanation=(
+                "No context or evidence was transmitted to TypeSafe/Jev because the outbound "
+                "dispatch policy was not satisfied."
+            ),
+        )
+
+    @staticmethod
+    def _dispatch_attempted_assessment() -> SensorAssessment:
+        return SensorAssessment(
+            status=SemanticStatus.UNKNOWN,
+            missing_information=(
+                "this manifest approval was already used for an external Jev attempt",
+            ),
+            provenance=Provenance(
+                provider="enzo",
+                locator="sensor:jev:dispatch-already-attempted",
+                tool="EnzoEngine",
+            ),
+            explanation=(
+                "Enzo did not repeat an external Jev call for the same manifest hash and "
+                "approval reference. Use a new approval_reference for an intentional retry."
+            ),
+        )
+
     @staticmethod
     def _is_stable_result(result: JEVResult) -> bool:
-        """Return whether an exact retry may safely reuse this observation result."""
+        """Return whether an exact retry must reuse this observation result.
 
-        return result.source is ResultSource.DETERMINISTIC or any(
-            item.kind is EvidenceKind.SENSOR_OUTPUT for item in result.evidence
+        A manifest means the outbound decision was fully determined. Reusing the
+        result prevents a transport retry from duplicating a Jev call even when the
+        provider returned no usable sensor evidence or raised a handled error.
+        """
+
+        return (
+            result.source is ResultSource.DETERMINISTIC
+            or result.dispatch_manifest is not None
+            or any(item.kind is EvidenceKind.SENSOR_OUTPUT for item in result.evidence)
         )
 
     @staticmethod

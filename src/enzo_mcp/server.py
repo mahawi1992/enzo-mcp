@@ -16,7 +16,7 @@ from .models import (
 engine = EnzoEngine()
 mcp = MCPServer(
     "Enzo",
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
         "Enzo reduces a problem into independently falsifiable atomic claims. "
         "Use enzo_atomize before enzo_observe. UNKNOWN is a valid gap, not an error."
@@ -36,7 +36,10 @@ async def enzo_observe(request: ObserveRequest) -> JEVResult:
     """Evaluate typed evidence for one admitted atomic claim.
 
     Deterministic evidence is authoritative. With TYPESAFE_API_KEY configured,
-    semantic-only questions are evaluated by Pydantic AI's TypeSafe/Jev provider.
+    semantic-only questions can be evaluated by Pydantic AI's TypeSafe/Jev provider.
+    External evaluation is two-phase: first provide dispatch_selection to preview
+    the exact logical request, then repeat it with allow_external_jev=true and the
+    matching approved_dispatch_sha256.
     """
 
     return await engine.observe(request)

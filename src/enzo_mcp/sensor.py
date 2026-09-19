@@ -17,6 +17,7 @@ from typesafe_sdk import (
     NoulAnswer,
     Question,
     Questions,
+    RetryPolicy,
     Score,
     ScoreAnswer,
     SystemOneResponse,
@@ -30,6 +31,8 @@ from .models import (
     EvidenceKind,
     EvidenceRecord,
     ExpectedAnswerType,
+    JevDispatchManifest,
+    JevProviderQuestion,
     Provenance,
     SemanticStatus,
     VerificationMethod,
@@ -38,6 +41,8 @@ from .models import (
 
 _QUESTION_KEY = "claim"
 _DISTRIBUTION_TOLERANCE = 1e-3
+# One reviewed manifest authorizes one transport attempt; retries need a new assertion.
+_NO_TRANSPORT_RETRIES = RetryPolicy(max_retries=0)
 
 
 class SensorAssessment(ContractModel):
@@ -54,9 +59,9 @@ class SemanticSensor(Protocol):
     async def evaluate(
         self,
         atom: AtomicRequest,
-        evidence: tuple[EvidenceRecord, ...],
+        manifest: JevDispatchManifest,
     ) -> SensorAssessment:
-        """Evaluate one already-admitted atomic claim against typed evidence."""
+        """Evaluate one atom against a prepared, approved outbound request."""
 
 
 class SystemOneClient(Protocol):
@@ -66,6 +71,7 @@ class SystemOneClient(Protocol):
         questions: Questions,
         *,
         model: str | None = None,
+        retry: RetryPolicy | None = None,
     ) -> SystemOneResponse:
         """Return Jev answers for typed questions about state."""
 
@@ -88,23 +94,31 @@ class PydanticJevSensor:
         self._contradiction_threshold = contradiction_threshold
         self._client = client if client is not None else TypeSafeModel(model_name).client
 
+    @property
+    def model_name(self) -> str:
+        """Expose the exact model covered by a dispatch manifest."""
+
+        return self._model_name
+
     async def evaluate(
         self,
         atom: AtomicRequest,
-        evidence: tuple[EvidenceRecord, ...],
+        manifest: JevDispatchManifest,
     ) -> SensorAssessment:
-        if not atom.context and not evidence:
+        logical_request = manifest.logical_request
+        if not logical_request.state.context and not logical_request.state.evidence:
             return self._unknown(
                 "Jev needs context or evidence to evaluate this atom",
                 locator="sensor:jev:no-state",
             )
 
-        questions: Questions = {_QUESTION_KEY: self._question(atom)}
+        questions: Questions = {_QUESTION_KEY: self._question(logical_request.questions.claim)}
         try:
             response = await self._client.system_one(
-                self._state(atom, evidence),
+                cast(JSONContent, logical_request.state.model_dump(mode="json")),
                 questions,
-                model=self._model_name,
+                model=logical_request.model,
+                retry=_NO_TRANSPORT_RETRIES,
             )
         except TypeSafeError as error:
             return self._unknown(
@@ -200,60 +214,18 @@ class PydanticJevSensor:
             ),
         )
 
-    def _question(self, atom: AtomicRequest) -> Question:
-        if atom.expected_answer_type is ExpectedAnswerType.BOOLEAN:
-            return Noul(instructions=atom.question)
-        if atom.expected_answer_type is ExpectedAnswerType.CHOICE:
+    def _question(self, question: JevProviderQuestion) -> Question:
+        if question.type == "noul":
+            return Noul(instructions=question.instructions)
+        if question.type == "choice":
             return Choice(
-                instructions=atom.question,
-                criteria={option: option for option in atom.answer_options},
+                instructions=question.instructions,
+                criteria=question.criteria,
             )
-        return Score(instructions=atom.question, criteria=atom.score_criteria)
-
-    @staticmethod
-    def _state(
-        atom: AtomicRequest,
-        evidence: tuple[EvidenceRecord, ...],
-    ) -> JSONContent:
-        payload = {
-            "claim": {
-                "question": atom.question,
-                "subject": atom.subject,
-                "predicate": atom.predicate,
-                "scope": atom.scope,
-                "operator": atom.operator.value,
-                "expected_value": atom.expected_value,
-                "quantifier": atom.quantifier.value,
-                "expected_answer_type": atom.expected_answer_type.value,
-                "answer_options": list(atom.answer_options),
-                "score_criteria": list(atom.score_criteria),
-                "operational_definition": atom.operational_definition,
-                "verification_method": atom.verification_method.value,
-                "evidence_requirements": [
-                    requirement.model_dump(mode="json")
-                    for requirement in atom.evidence_requirements
-                ],
-            },
-            "scope": atom.scope,
-            "context": [item.model_dump(mode="json") for item in atom.context],
-            "evidence": [
-                {
-                    "direction": item.direction.value,
-                    "kind": item.kind.value,
-                    "summary": item.summary,
-                    "payload": item.payload,
-                    "assumptions": list(item.assumptions),
-                    "provenance": {
-                        "provider": item.provenance.provider,
-                        "locator": item.provenance.locator,
-                        "tool": item.provenance.tool,
-                        "content_hash": item.provenance.content_hash,
-                    },
-                }
-                for item in evidence
-            ],
-        }
-        return cast(JSONContent, payload)
+        return Score(
+            instructions=question.instructions,
+            criteria=cast(list[str], question.criteria),
+        )
 
     def _boolean_outcome(
         self,
@@ -432,12 +404,18 @@ class PydanticJevSensor:
 class UnconfiguredJevSensor:
     """Fail closed when TYPESAFE_API_KEY is absent."""
 
+    @property
+    def model_name(self) -> str:
+        """Keep previews deterministic without making an external client available."""
+
+        return "jev-latest"
+
     async def evaluate(
         self,
         atom: AtomicRequest,
-        evidence: tuple[EvidenceRecord, ...],
+        manifest: JevDispatchManifest,
     ) -> SensorAssessment:
-        del atom, evidence
+        del atom, manifest
         return SensorAssessment(
             status=SemanticStatus.UNKNOWN,
             missing_information=("JEV semantic sensor is not configured",),
