@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from contextlib import suppress
+from datetime import UTC, datetime
 from math import isclose, isfinite
 from typing import Protocol, cast
 
-from pydantic import Field
+from pydantic import Field, JsonValue
 from pydantic_ai.models.typesafe import TypeSafeModel
 from typesafe_sdk import (
     Choice,
@@ -38,6 +40,7 @@ from .models import (
     VerificationMethod,
     new_id,
 )
+from .response_cache import JevCacheHit, JevResponseCache, response_cache_from_env
 
 _QUESTION_KEY = "claim"
 _DISTRIBUTION_TOLERANCE = 1e-3
@@ -86,13 +89,23 @@ class PydanticJevSensor:
         verify_threshold: float = 0.8,
         contradiction_threshold: float = 0.2,
         client: SystemOneClient | None = None,
+        cache: JevResponseCache | None = None,
     ) -> None:
         if not 0 < contradiction_threshold < verify_threshold < 1:
             raise ValueError("thresholds must satisfy 0 < contradiction < verify < 1")
         self._model_name = model_name
         self._verify_threshold = verify_threshold
         self._contradiction_threshold = contradiction_threshold
-        self._client = client if client is not None else TypeSafeModel(model_name).client
+        self._client = (
+            client
+            if client is not None
+            else (
+                TypeSafeModel(model_name).client
+                if os.getenv("TYPESAFE_API_KEY", "").strip()
+                else None
+            )
+        )
+        self._cache = cache
 
     @property
     def model_name(self) -> str:
@@ -113,6 +126,25 @@ class PydanticJevSensor:
             )
 
         questions: Questions = {_QUESTION_KEY: self._question(logical_request.questions.claim)}
+        if self._cache is not None:
+            try:
+                cache_hit = await self._cache.get(manifest)
+            except Exception:
+                cache_hit = None
+            if cache_hit is not None:
+                assessment, valid = self._assessment_from_response(
+                    atom,
+                    cache_hit.response,
+                    cache_hit=cache_hit,
+                )
+                if valid:
+                    return assessment
+
+        if self._client is None:
+            return self._unknown(
+                "JEV semantic sensor is not configured and no cached response matched",
+                locator="sensor:jev:unconfigured-cache-miss",
+            )
         try:
             response = await self._client.system_one(
                 cast(JSONContent, logical_request.state.model_dump(mode="json")),
@@ -126,20 +158,41 @@ class PydanticJevSensor:
                 locator="sensor:jev:request-failed",
             )
 
+        assessment, valid = self._assessment_from_response(atom, response)
+        if valid and self._cache is not None:
+            with suppress(Exception):
+                await self._cache.put(manifest, response)
+        return assessment
+
+    def _assessment_from_response(
+        self,
+        atom: AtomicRequest,
+        response: SystemOneResponse,
+        *,
+        cache_hit: JevCacheHit | None = None,
+    ) -> tuple[SensorAssessment, bool]:
+        """Validate one typed response and map it to Enzo's semantic contract."""
+
         answer = response.answers.get(_QUESTION_KEY)
         if answer is None:
-            return self._unknown(
-                "Jev returned no answer for the atomic claim",
-                locator=f"model:{response.model}",
+            return (
+                self._unknown(
+                    "Jev returned no answer for the atomic claim",
+                    locator=f"model:{response.model}",
+                ),
+                False,
             )
 
         if atom.expected_answer_type is ExpectedAnswerType.BOOLEAN:
             if not isinstance(answer, NoulAnswer):
-                return self._unexpected_answer(response)
+                return self._unexpected_answer(response), False
             if not self._is_probability(answer.noul):
-                return self._invalid_answer_contract(
-                    response,
-                    "Jev returned a yes/no probability outside the finite [0, 1] range",
+                return (
+                    self._invalid_answer_contract(
+                        response,
+                        "Jev returned a yes/no probability outside the finite [0, 1] range",
+                    ),
+                    False,
                 )
             status, direction, gap = self._boolean_outcome(
                 answer.noul,
@@ -147,10 +200,10 @@ class PydanticJevSensor:
             )
         elif atom.expected_answer_type is ExpectedAnswerType.CHOICE:
             if not isinstance(answer, ChoiceAnswer):
-                return self._unexpected_answer(response)
+                return self._unexpected_answer(response), False
             contract_gap = self._choice_contract_gap(atom, answer)
             if contract_gap is not None:
-                return self._invalid_answer_contract(response, contract_gap)
+                return self._invalid_answer_contract(response, contract_gap), False
             status, direction, gap = self._choice_outcome(
                 answer.choice,
                 answer.confidence,
@@ -158,22 +211,47 @@ class PydanticJevSensor:
             )
         else:
             if not isinstance(answer, ScoreAnswer):
-                return self._unexpected_answer(response)
+                return self._unexpected_answer(response), False
             contract_gap = self._score_contract_gap(atom, answer)
             if contract_gap is not None:
-                return self._invalid_answer_contract(response, contract_gap)
+                return self._invalid_answer_contract(response, contract_gap), False
             status, direction, gap = self._score_outcome(
                 answer,
                 cast(int, atom.expected_value),
             )
 
         evidence_id = new_id("evidence")
-        provenance = Provenance(
-            provider="pydantic-ai/typesafe",
-            locator=f"model:{response.model}",
-            tool="TypeSafeModel.system_one",
-            run_id=evidence_id,
-        )
+        if cache_hit is None:
+            provenance = Provenance(
+                provider="pydantic-ai/typesafe",
+                locator=f"model:{response.model}",
+                tool="TypeSafeModel.system_one",
+                run_id=evidence_id,
+            )
+            cache_payload: dict[str, JsonValue] = {"hit": False}
+        else:
+            provenance = Provenance(
+                provider="enzo/jev-response-cache",
+                locator=(
+                    f"cache:{cache_hit.namespace}:{cache_hit.model_epoch}:{cache_hit.cache_key}"
+                ),
+                tool="JevResponseCache.get",
+                run_id=evidence_id,
+                content_hash=cache_hit.response_sha256,
+                observed_at=cache_hit.created_at,
+            )
+            cache_payload = {
+                "hit": True,
+                "namespace": cache_hit.namespace,
+                "model_epoch": cache_hit.model_epoch,
+                "key_sha256": cache_hit.cache_key,
+                "response_sha256": cache_hit.response_sha256,
+                "created_at": cache_hit.created_at.isoformat(),
+                "expires_at": cache_hit.expires_at.isoformat(),
+                "retrieved_at": datetime.now(UTC).isoformat(),
+                "original_provider": "pydantic-ai/typesafe",
+                "usage_is_original": True,
+            }
         sensor_evidence = EvidenceRecord(
             id=evidence_id,
             atom_id=atom.id,
@@ -188,30 +266,39 @@ class PydanticJevSensor:
                     "verify": self._verify_threshold,
                     "contradiction": self._contradiction_threshold,
                 },
+                "cache": cache_payload,
             },
             deterministic=False,
             verification_method=VerificationMethod.SEMANTIC_SENSOR,
             requirement_ids=self._compatible_requirements(atom),
             provenance=provenance,
         )
-        return SensorAssessment(
-            status=status,
-            evidence=(sensor_evidence,),
-            missing_information=(() if gap is None else (gap,)),
-            satisfied_constraints=(
-                ("Jev's typed answer matched the atom's expected outcome",)
-                if status is SemanticStatus.VERIFIED
-                else ()
+        return (
+            SensorAssessment(
+                status=status,
+                evidence=(sensor_evidence,),
+                missing_information=(() if gap is None else (gap,)),
+                satisfied_constraints=(
+                    ("Jev's typed answer matched the atom's expected outcome",)
+                    if status is SemanticStatus.VERIFIED
+                    else ()
+                ),
+                violated_constraints=(
+                    ("Jev's typed answer contradicted the atom's expected outcome",)
+                    if status is SemanticStatus.CONTRADICTED
+                    else ()
+                ),
+                provenance=provenance,
+                explanation=(
+                    "Enzo reused one cached typed Jev response for the exact approved request."
+                    if cache_hit is not None
+                    else (
+                        "Jev evaluated one typed question against only the supplied context "
+                        "and evidence."
+                    )
+                ),
             ),
-            violated_constraints=(
-                ("Jev's typed answer contradicted the atom's expected outcome",)
-                if status is SemanticStatus.CONTRADICTED
-                else ()
-            ),
-            provenance=provenance,
-            explanation=(
-                "Jev evaluated one typed question against only the supplied context and evidence."
-            ),
+            True,
         )
 
     def _question(self, question: JevProviderQuestion) -> Question:
@@ -434,6 +521,7 @@ class UnconfiguredJevSensor:
 def default_sensor() -> SemanticSensor:
     """Select the official Jev adapter only when its credential is available."""
 
-    if os.getenv("TYPESAFE_API_KEY", "").strip():
-        return PydanticJevSensor()
+    cache = response_cache_from_env()
+    if os.getenv("TYPESAFE_API_KEY", "").strip() or cache is not None:
+        return PydanticJevSensor(cache=cache)
     return UnconfiguredJevSensor()

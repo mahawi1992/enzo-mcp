@@ -14,7 +14,7 @@
   <a href="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="MCP tools" src="https://img.shields.io/badge/MCP-3_tools-111827">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-72_passing-2EA043">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-85_passing-2EA043">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-D22128"></a>
 </p>
 
@@ -22,6 +22,7 @@
   <a href="#why-enzo">Why Enzo?</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="#jev-response-memory">Jev memory</a> ·
   <a href="#the-three-tools">Tools</a> ·
   <a href="#example">Example</a>
 </p>
@@ -74,6 +75,7 @@ The responsibilities stay deliberately separate:
 | **LLM** | Intelligence, strategy, interpretation, and choosing the next question |
 | **Enzo** | Atomicity, evidence contracts, state transitions, and decomposition pressure |
 | **Jev** | Typed semantic sensing against supplied context and evidence |
+| **Jev response memory** | Bounded reuse of exact approved responses without storing request state |
 | **Deterministic tools** | Tests, schemas, AST inspection, type checking, and runtime measurements |
 
 ## Quick start
@@ -103,6 +105,20 @@ Run with the local key loaded when semantic sensing is needed:
 ```bash
 uv run --env-file .env enzo-mcp
 ```
+
+Exact approved Jev responses can optionally be remembered across Enzo processes.
+Add a deployment-owned namespace and explicit model epoch to `.env`:
+
+```dotenv
+ENZO_JEV_CACHE_DIR=.enzo-cache
+ENZO_JEV_CACHE_NAMESPACE=my-project-dev
+ENZO_JEV_CACHE_MODEL_EPOCH=jev-1.13.0
+ENZO_JEV_CACHE_TTL_SECONDS=86400
+ENZO_JEV_CACHE_MAX_ENTRIES=10000
+```
+
+The directory is ignored by Git. Use a new model epoch whenever the effective Jev
+model changes; do not use the moving `jev-latest` alias as an epoch.
 
 ### Add Enzo to Codex
 
@@ -220,6 +236,34 @@ correctly invalidate replayed results. A manifest-bound provider failure is also
 cached to prevent an ambiguous transport retry from making a duplicate external
 call; an intentional retry must use a new `approval_reference`.
 
+## Jev response memory
+
+Enzo includes an optional local response ledger inspired by
+[JevCache](https://jevcache.sh/#share). It follows the same useful core idea—reuse
+an answer for a stable request fingerprint—but keeps Enzo's stricter approval and
+privacy boundaries:
+
+- A cache lookup happens only after the normal two-phase manifest approval succeeds.
+- Identity binds the exact canonical request digest to a deployment namespace, an
+  explicit model epoch, and Enzo's cache schema version.
+- The SQLite ledger stores only Jev's typed response and integrity metadata. It never
+  stores selected context, evidence, atom IDs, investigation IDs, or approval references.
+- Entries expire, have a configurable upper bound, and are evicted oldest-accessed first.
+- Corrupt, expired, or contract-invalid entries are ignored. Cache read/write failure
+  never changes the underlying provider result.
+- Existing cache directories, databases, and SQLite sidecars are hardened to private
+  owner-only permissions; symbolic-link cache files are rejected.
+- An exact cache hit can be replayed without a provider key, but it still requires a
+  fresh valid approval for that manifest.
+
+Public sharing is deliberately not automatic. JevCache v0.1 currently publishes a
+prebuilt sidecar and global fingerprint index, but its public repository does not yet
+provide enough source and lifecycle detail for Enzo to independently audit deletion,
+expiry, tenant isolation, or redaction-equivalence behavior. The local ledger is the
+safe memory layer today; a remote JevCache adapter can be added behind the same narrow
+interface once that contract is reviewable. See the
+[trust-boundary notes](docs/jev-response-memory.md).
+
 ## AG-UI boundary
 
 AG-UI is a good future host adapter for displaying a manifest, pausing on a typed
@@ -250,10 +294,10 @@ uv run pytest
 uv build
 ```
 
-The current suite contains 72 tests covering contracts, atomicity, dependency
+The current suite contains 85 tests covering contracts, atomicity, dependency
 derivation, revision history, manifest-bound dispatch, payload canaries and limits,
 generated replay and dependency invariants, offline evaluation fixtures, Jev answer
-validation, and the stdio MCP surface.
+validation, response-memory privacy and lifecycle controls, and the stdio MCP surface.
 
 ## Privacy
 
@@ -263,9 +307,13 @@ matching `approved_dispatch_sha256`. Preview the manifest, select only necessary
 fields, and keep payload, assumption, and provenance flags off unless Jev needs
 them. Redact credentials and personal data before any external observation.
 
+The optional response ledger does not retain request state, but Jev's typed answers
+can still be sensitive. Keep its directory private, use distinct namespaces per trust
+boundary, choose short retention where appropriate, and never commit the database.
+
 ## Project status
 
-Enzo is a focused v0.2 alpha implementation. Its three-tool surface is intentional; the
+Enzo is a focused v0.3 alpha implementation. Its three-tool surface is intentional; the
 contracts may evolve as real investigations expose better invariants.
 
 Focused issues and pull requests are welcome. If the idea of turning large circles
