@@ -5,15 +5,39 @@ build-backend = "hatchling.build"
 [project]
 name = "enzo-mcp"
 version = "0.1.0"
-description = "Atomic semantic reasoning MCP designed to work with JEV"
+description = "Atomic reasoning MCP server that decomposes large LLM questions into independently falsifiable claims for Jev"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+keywords = [
+  "ai-tools",
+  "jev",
+  "llm",
+  "mcp",
+  "model-context-protocol",
+  "pydantic",
+  "reasoning",
+  "semantic-reasoning",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
 dependencies = [
   "mcp>=2.0,<3",
   "pydantic>=2.11,<3",
   "pydantic-ai-slim[typesafe]>=2.45,<3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mahawi1992/enzo-mcp"
+Repository = "https://github.com/mahawi1992/enzo-mcp"
+Issues = "https://github.com/mahawi1992/enzo-mcp/issues"
 
 [project.scripts]
 enzo-mcp = "enzo_mcp.server:main"
