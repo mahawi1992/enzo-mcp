@@ -216,6 +216,24 @@ class PydanticJevSensor:
         evidence: tuple[EvidenceRecord, ...],
     ) -> JSONContent:
         payload = {
+            "claim": {
+                "question": atom.question,
+                "subject": atom.subject,
+                "predicate": atom.predicate,
+                "scope": atom.scope,
+                "operator": atom.operator.value,
+                "expected_value": atom.expected_value,
+                "quantifier": atom.quantifier.value,
+                "expected_answer_type": atom.expected_answer_type.value,
+                "answer_options": list(atom.answer_options),
+                "score_criteria": list(atom.score_criteria),
+                "operational_definition": atom.operational_definition,
+                "verification_method": atom.verification_method.value,
+                "evidence_requirements": [
+                    requirement.model_dump(mode="json")
+                    for requirement in atom.evidence_requirements
+                ],
+            },
             "scope": atom.scope,
             "context": [item.model_dump(mode="json") for item in atom.context],
             "evidence": [

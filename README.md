@@ -14,7 +14,7 @@
   <a href="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mahawi1992/enzo-mcp/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="MCP tools" src="https://img.shields.io/badge/MCP-3_tools-111827">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-54_passing-2EA043">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-55_passing-2EA043">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-D22128"></a>
 </p>
 
@@ -183,6 +183,13 @@ Jev's native probability or confidence is preserved in sensor evidence. Enzo doe
 not manufacture an aggregate confidence score. A deterministic instrument is used
 first whenever it can resolve the atom more reliably.
 
+For an explicitly authorized observation, Jev receives a structured `claim` object
+containing the question, subject, predicate, scope, operator, expected answer,
+answer contract, operational definition, verification method, and evidence
+requirements. This keeps Jev's semantic judgment grounded in the same atomic
+contract that Enzo validated instead of asking it to infer the claim from a short
+question alone.
+
 Prior sensor output is never sent back into a later Jev request, preventing semantic
 feedback loops. Exact observation retries are idempotent, while dependency changes
 correctly invalidate replayed results.
@@ -209,7 +216,7 @@ uv run pytest
 uv build
 ```
 
-The current suite contains 54 tests covering contracts, atomicity, dependency
+The current suite contains 55 tests covering contracts, atomicity, dependency
 derivation, revision history, consent, Jev answer validation, replay safety, and the
 stdio MCP surface.
 
@@ -217,8 +224,9 @@ stdio MCP surface.
 
 Semantic observations are local-only by default. Setting
 `allow_external_jev=true` authorizes that single request to send its supplied
-context and evidence to TypeSafe/Jev. Redact credentials, personal data, and
-unrelated sensitive information before enabling an external observation.
+claim contract, context, and non-sensor evidence to TypeSafe/Jev. Redact
+credentials, personal data, and unrelated sensitive information from all three
+before enabling an external observation.
 
 ## Project status
 

@@ -96,9 +96,91 @@ async def test_pydantic_jev_verifies_supported_boolean_atom(make_request) -> Non
     assert isinstance(cast(dict[str, object], client.questions)["claim"], Noul)
     state = cast(dict[str, object], client.state)
     assert "question" not in state
+    claim = cast(dict[str, object], state["claim"])
+    assert claim["question"] == "Does the production session cookie set Secure=true?"
+    assert claim["subject"] == "the production session cookie"
+    assert claim["predicate"] == "sets Secure=true"
+    assert claim["scope"] == "production session configuration"
+    assert claim["operator"] == "EQUALS"
+    assert claim["expected_value"] is True
+    assert claim["expected_answer_type"] == "BOOLEAN"
+    requirements = cast(list[dict[str, object]], claim["evidence_requirements"])
+    assert requirements[0]["id"] == "jev-observation"
     assert state["scope"] == "production session configuration"
     context = cast(list[dict[str, object]], state["context"])
     assert context[0]["kind"] == "ASSUMPTION"
+
+
+async def test_pydantic_jev_sends_complete_atomic_claim_contract(make_request) -> None:
+    requirement = EvidenceRequirement(
+        id="semantic-choice",
+        description="Jev selects the deployment state from supplied evidence",
+        accepted_kinds=(EvidenceKind.SENSOR_OUTPUT,),
+    )
+    answer = ChoiceAnswer(
+        choice="enabled",
+        confidence=0.92,
+        probabilities={"enabled": 0.92, "disabled": 0.08},
+    )
+    client = FakeSystemOneClient(answer)
+    engine = EnzoEngine(sensor=PydanticJevSensor(client=client))
+    atomized = await engine.atomize(
+        make_request(
+            question="Which deployment state is supported?",
+            subject="the deployment",
+            predicate="has the selected state",
+            scope="the supplied deployment record",
+            operator=PredicateOperator.EQUALS,
+            expected_answer_type=ExpectedAnswerType.CHOICE,
+            answer_options=("enabled", "disabled"),
+            expected_value="enabled",
+            operational_definition="Select the state explicitly named in the record.",
+            context=(
+                ContextItem(
+                    key="deployment-state",
+                    value="enabled",
+                    kind=ContextKind.ASSUMPTION,
+                ),
+            ),
+            evidence_requirements=(requirement,),
+            verification_method=VerificationMethod.SEMANTIC_SENSOR,
+        )
+    )
+
+    await engine.observe(
+        ObserveRequest(
+            allow_external_jev=True,
+            investigation_id=atomized.investigation_id,
+            atom_id=atomized.atom.id,
+        )
+    )
+
+    state = cast(dict[str, object], client.state)
+    claim = cast(dict[str, object], state["claim"])
+    assert claim == {
+        "question": "Which deployment state is supported?",
+        "subject": "the deployment",
+        "predicate": "has the selected state",
+        "scope": "the supplied deployment record",
+        "operator": "EQUALS",
+        "expected_value": "enabled",
+        "quantifier": "ONE",
+        "expected_answer_type": "CHOICE",
+        "answer_options": ["enabled", "disabled"],
+        "score_criteria": [],
+        "operational_definition": "Select the state explicitly named in the record.",
+        "verification_method": "SEMANTIC_SENSOR",
+        "evidence_requirements": [
+            {
+                "id": "semantic-choice",
+                "description": "Jev selects the deployment state from supplied evidence",
+                "accepted_kinds": ["SENSOR_OUTPUT"],
+                "minimum_items": 1,
+                "required": True,
+                "deterministic_required": False,
+            }
+        ],
+    }
 
 
 async def test_pydantic_jev_keeps_uncertain_boolean_unresolved(make_request) -> None:
